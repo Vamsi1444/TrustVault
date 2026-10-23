@@ -1,18 +1,22 @@
 from pathlib import Path
+from datetime import datetime
 
 from flask import Blueprint, request, jsonify, send_file
 from flask_jwt_extended import jwt_required, get_jwt_identity
+from sqlalchemy import or_
 
 from app.extensions import db
 from app.models.users import User
 from app.models.document import Document
 from app.models.permission import DocumentPermission
+
 from app.services.permissions import can_read_document
-from app.services.storage import save_private_file, get_private_file_path
+from app.services.storage import (
+    save_private_file,
+    get_private_file_path
+)
 from app.services.audit import record_audit
-from datetime import datetime
-from sqlalchemy import or_
-from app.models.permission import DocumentPermission
+
 
 documents_bp = Blueprint(
     "documents",
@@ -76,6 +80,7 @@ def get_document(document_id):
             outcome="denied",
             actor_id=user.id if user else None
         )
+
         return jsonify({"error": "Access denied"}), 403
 
     record_audit(
@@ -116,7 +121,9 @@ def upload_document():
     category = request.form.get("category", "General").strip()
 
     if not uploaded_file.filename or not title:
-        return jsonify({"error": "Filename and title are required"}), 400
+        return jsonify({
+            "error": "Filename and title are required"
+        }), 400
 
     storage_key = None
 
@@ -151,20 +158,24 @@ def upload_document():
         }), 201
 
     except ValueError as error:
+
         db.session.rollback()
 
         if storage_key:
             path = get_private_file_path(storage_key)
+
             if path:
                 Path(path).unlink(missing_ok=True)
 
         return jsonify({"error": str(error)}), 400
 
     except Exception:
+
         db.session.rollback()
 
         if storage_key:
             path = get_private_file_path(storage_key)
+
             if path:
                 Path(path).unlink(missing_ok=True)
 
@@ -186,8 +197,8 @@ def download_document(document_id):
         return jsonify({"error": "Document not found"}), 404
 
     # Authorization MUST happen before file access.
-
     if not can_read_document(user, document):
+
         record_audit(
             action="DOCUMENT_DOWNLOAD",
             resource_type="document",
@@ -217,6 +228,7 @@ def download_document(document_id):
         mimetype="application/octet-stream"
     )
 
+
 # --------------------------------------------------
 # SEARCH DOCUMENTS
 # --------------------------------------------------
@@ -230,7 +242,7 @@ def search_documents():
     if not user or not user.is_active:
         return jsonify({"error": "Unauthorized"}), 401
 
-    # Only documents owned by the user or explicitly shared with them.
+    # Only owned or explicitly shared documents.
     query = Document.query.outerjoin(
         DocumentPermission,
         (DocumentPermission.document_id == Document.id) &
@@ -268,6 +280,7 @@ def search_documents():
     date_to = request.args.get("date_to")
 
     try:
+
         if date_from:
             start_date = datetime.strptime(date_from, "%Y-%m-%d")
             query = query.filter(Document.uploaded_at >= start_date)
@@ -279,9 +292,11 @@ def search_documents():
                 minute=59,
                 second=59
             )
+
             query = query.filter(Document.uploaded_at <= end_date)
 
     except ValueError:
+
         return jsonify({
             "error": "Dates must use YYYY-MM-DD format"
         }), 400
@@ -304,6 +319,8 @@ def search_documents():
             for doc in documents
         ]
     }), 200
+
+
 # --------------------------------------------------
 # DELETE DOCUMENT
 # --------------------------------------------------
@@ -313,11 +330,16 @@ def search_documents():
 def delete_document(document_id):
 
     user = get_current_user()
+
+    if not user or not user.is_active:
+        return jsonify({"error": "Unauthorized"}), 401
+
     document = db.session.get(Document, document_id)
 
     if not document:
         return jsonify({"error": "Document not found"}), 404
 
+    # Only the document owner can delete it.
     if document.owner_id != user.id:
 
         record_audit(
@@ -325,7 +347,7 @@ def delete_document(document_id):
             resource_type="document",
             resource_id=document_id,
             outcome="denied",
-            actor_id=user.id if user else None
+            actor_id=user.id
         )
 
         return jsonify({"error": "Access denied"}), 403
@@ -333,6 +355,7 @@ def delete_document(document_id):
     file_path = get_private_file_path(document.storage_key)
 
     try:
+
         record_audit(
             action="DOCUMENT_DELETE",
             resource_type="document",
@@ -340,9 +363,16 @@ def delete_document(document_id):
             actor_id=user.id
         )
 
+        # Remove permissions associated with this document.
+        DocumentPermission.query.filter_by(
+            document_id=document.id
+        ).delete(synchronize_session=False)
+
+        # Delete the document database record.
         db.session.delete(document)
         db.session.commit()
 
+        # Delete the physical file after database success.
         if file_path:
             Path(file_path).unlink(missing_ok=True)
 
@@ -351,5 +381,6 @@ def delete_document(document_id):
         }), 200
 
     except Exception:
+
         db.session.rollback()
         raise
